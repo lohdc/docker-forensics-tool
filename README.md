@@ -19,7 +19,34 @@ docker-forensics-tool/
 
 ## Overview
 
-This tool is designed for digital forensics investigators who need to analyze Docker images from disk images without having Docker installed. It can extract Docker image layers and reconstruct them into a format that can be imported into Docker on another system.
+This tool is designed for digital forensics investigators who need to analyze Docker images from disk images without having Docker installed. It can extract Docker image layers and reconstruct them into a format that can be imported into Docker on another system. 
+
+To find all the layers of a specific image (e.g., nginx:latest), Docker stores image metadata in:
+
+ `/var/lib/docker/image/overlay2/imagedb/content/sha256`
+
+The content of that file is JSON, containing:
+```{
+  "rootfs": {
+    "diff_ids": [
+      "sha256:layer1",
+      "sha256:layer2",
+      ...
+    ]
+  },
+  ...
+}
+```
+Match each `diff_id` (sha256 hash) to layer IDs in:
+
+`/var/lib/docker/image/overlay2/layerdb/sha256/`
+
+Each directory in there represents a layer and contains a `diff` file:
+
+`/var/lib/docker/image/overlay2/layerdb/sha256/<layer>/diff`
+
+Layers must be applied in the correct order (lowest to highest)
+
 
 ## Features
 
