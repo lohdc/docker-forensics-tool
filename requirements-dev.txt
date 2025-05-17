@@ -1,0 +1,8 @@
+# Test dependencies
+pytest>=6.0.0
+pytest-cov>=2.10.0
+
+# Development dependencies
+black>=21.5b2
+flake8>=3.9.0
+mypy>=0.900
