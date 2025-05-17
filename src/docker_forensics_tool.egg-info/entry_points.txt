@@ -1,0 +1,2 @@
+[console_scripts]
+docker-forensics = docker_forensics.cli:main
