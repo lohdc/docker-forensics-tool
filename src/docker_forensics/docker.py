@@ -3,10 +3,12 @@ Docker-specific functionality for image extraction and analysis.
 """
 
 import os
+import sys
+import re
 import json
 import tarfile
-import re
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from .utils import normalize_path
 
 def find_docker_root(mount_path):
@@ -75,181 +77,26 @@ def clean_and_parse_json(file_path):
     
     raise ValueError("Could not find valid JSON content in file")
 
-def find_layer_dir(docker_root, layer_id):
-    """Find the directory containing a specific layer."""
-    print(f"\nLooking for layer {layer_id}")
-    
-    # Clean up layer ID - remove sha256: prefix if present
-    clean_id = layer_id.replace('sha256:', '')
-    print(f"Cleaned layer ID: {clean_id}")
-    
-    # Search locations
-    locations = {
-        'image_db': os.path.join(docker_root, 'image', 'overlay2', 'imagedb', 'content', 'sha256'),
-        'layer_db': os.path.join(docker_root, 'image', 'overlay2', 'layerdb', 'sha256'),
-        'overlay2': os.path.join(docker_root, 'overlay2'),
-        'overlay2_l': os.path.join(docker_root, 'overlay2', 'l')
-    }
-
-    # Debug: Print all locations
-    print("\nSearching in locations:")
-    for name, path in locations.items():
-        exists = os.path.exists(path)
-        print(f"- {name}: {path} {'(exists)' if exists else '(not found)'}")
-    
-    # First check the layer database
-    layer_path = os.path.join(locations['layer_db'], clean_id)
-    print(f"\nChecking layer DB path: {layer_path}")
-    
-    if os.path.exists(layer_path):
-        print(f"Found layer info in layer DB")
-        try:
-            # Read the cache ID
-            cache_id_file = os.path.join(layer_path, 'cache-id')
-            if os.path.exists(cache_id_file):
-                with open(cache_id_file, 'r') as f:
-                    cache_id = f.read().strip()
-                print(f"Found cache ID: {cache_id}")
-                
-                # Look for the layer content
-                content_dir = os.path.join(locations['overlay2'], cache_id)
-                if os.path.exists(content_dir):
-                    print(f"Found layer content at: {content_dir}")
-                    return content_dir
-            
-            # Try diff file if cache-id didn't work
-            diff_file = os.path.join(layer_path, 'diff')
-            if os.path.exists(diff_file):
-                with open(diff_file, 'r') as f:
-                    diff_id = f.read().strip()
-                print(f"Found diff ID: {diff_id}")
-                
-                content_dir = os.path.join(locations['overlay2'], diff_id)
-                if os.path.exists(content_dir):
-                    print(f"Found layer content at: {content_dir}")
-                    return content_dir
-        except Exception as e:
-            print(f"Error reading layer metadata: {e}")
-
-    # Check direct path in overlay2
-    direct_path = os.path.join(locations['overlay2'], clean_id)
-    print(f"\nChecking direct overlay2 path: {direct_path}")
-    if os.path.exists(direct_path):
-        print(f"Found layer directly")
-        return direct_path
-
-    # Check shortened IDs in overlay2/l directory
-    if os.path.exists(locations['overlay2_l']):
-        print("\nChecking shortened IDs...")
-        try:
-            link_count = 0
-            for link_name in os.listdir(locations['overlay2_l']):
-                link_count += 1
-                if link_count % 50 == 0:
-                    print(f"Checked {link_count} links...")
-                try:
-                    # Check both ways - layer ID starts with link name or link name starts with layer ID
-                    if clean_id.startswith(link_name) or link_name.startswith(clean_id[:12]):
-                        link_path = os.path.join(locations['overlay2_l'], link_name)
-                        if os.path.islink(link_path):
-                            target = os.readlink(link_path)
-                            print(f"Found matching link: {link_name} -> {target}")
-                            if not os.path.isabs(target):
-                                target = os.path.join(locations['overlay2'], os.path.basename(target))
-                            if os.path.exists(target):
-                                print(f"Found valid layer through link")
-                                return target
-                            else:
-                                print(f"Link target does not exist: {target}")
-                except Exception as e:
-                    print(f"Error checking link {link_name}: {e}")
-                    continue
-            print(f"Checked {link_count} total links")
-        except Exception as e:
-            print(f"Error reading link directory: {e}")
-
-    # Additional checks for mount namespaces
-    mount_file = os.path.join(locations['layer_db'], clean_id, 'mount-id')
-    print(f"\nChecking mount ID: {mount_file}")
-    if os.path.exists(mount_file):
-        try:
-            with open(mount_file, 'r') as f:
-                mount_id = f.read().strip()
-            print(f"Found mount ID: {mount_id}")
-            mount_path = os.path.join(locations['overlay2'], mount_id)
-            if os.path.exists(mount_path):
-                print("Found layer through mount ID")
-                return mount_path
-            else:
-                print(f"Mount ID path does not exist: {mount_path}")
-        except Exception as e:
-            print(f"Error reading mount ID: {e}")
-
-    # Print available items in overlay2 for debugging
-    print(f"\nListing contents of overlay2 directory:")
-    try:
-        overlay2_items = [d for d in os.listdir(locations['overlay2']) if d != 'l'][:10]
-        if overlay2_items:
-            print("First 10 items:")
-            for item in overlay2_items:
-                print(f"- {item}")
-            if len(overlay2_items) >= 10:
-                print("... (more items)")
-        else:
-            print("No items found in overlay2 directory")
-    except Exception as e:
-        print(f"Error listing overlay2 directory: {e}")
-
-    raise ValueError(f"Could not find directory for layer {clean_id}")
-
 def extract_layer_contents(layer_path, output_dir):
     """Extract the contents of a layer to a tarball."""
     print(f"\nExtracting layer from: {layer_path}")
     
-    # Check for different layer content locations
-    possible_dirs = [
-        os.path.join(layer_path, 'diff'),
-        layer_path,
-        os.path.join(layer_path, 'root'),
-        os.path.join(layer_path, 'merged')
-    ]
-    
+    # Determine the diff directory
     diff_dir = None
-    for dir_path in possible_dirs:
-        print(f"\nChecking for layer content in: {dir_path}")
-        if os.path.exists(dir_path):
-            if os.path.isdir(dir_path):
-                try:
-                    # Verify we can access and list the directory
-                    items = os.listdir(dir_path)
-                    print(f"Found {len(items)} items")
-                    if len(items) > 0:
-                        print("Sample items:")
-                        for item in items[:5]:
-                            item_path = os.path.join(dir_path, item)
-                            type_str = 'dir' if os.path.isdir(item_path) else 'file' if os.path.isfile(item_path) else 'link' if os.path.islink(item_path) else 'unknown'
-                            print(f"- {item} ({type_str})")
-                        if len(items) > 5:
-                            print("... (more items)")
-                    diff_dir = dir_path
-                    print(f"Using content directory: {diff_dir}")
-                    break
-                except Exception as e:
-                    print(f"Cannot access {dir_path}: {e}")
-                    continue
-            else:
-                print(f"Path exists but is not a directory")
+    if os.path.isdir(layer_path):
+        if os.path.exists(os.path.join(layer_path, 'diff')):
+            diff_dir = os.path.join(layer_path, 'diff')
         else:
-            print("Path does not exist")
+            diff_dir = layer_path
     
-    if not diff_dir:
-        raise ValueError(f"Could not find accessible content in any of these paths:\n" + "\n".join(f"- {p}" for p in possible_dirs))
-    
+    if not diff_dir or not os.path.exists(diff_dir):
+        raise ValueError(f"Could not find valid content directory in {layer_path}")
+
     layer_tarball = os.path.join(output_dir, 'layer.tar')
-    print(f"\nCreating layer tarball: {layer_tarball}")
+    print(f"Creating layer tarball: {layer_tarball}")
     
     try:
-        # Get list of all files and directories first
+        # Get list of all files and directories
         all_items = []
         for root, dirs, files in os.walk(diff_dir):
             for d in dirs:
@@ -257,28 +104,24 @@ def extract_layer_contents(layer_path, output_dir):
             for f in files:
                 all_items.append(('file', os.path.join(root, f)))
 
-        total_items = len(all_items)
-        if total_items == 0:
+        if not all_items:
             raise ValueError(f"No items found in {diff_dir}")
 
-        print(f"Found {total_items} items to process")
-        
+        print(f"Found {len(all_items)} items to process")
         processed_items = 0
-        errors = []
         successful_items = 0
+        errors = []
 
         with tarfile.open(layer_tarball, 'w') as tar:
             for item_type, item_path in all_items:
                 try:
-                    # Calculate the path relative to the diff directory
                     arcname = os.path.relpath(item_path, diff_dir)
-                    print(f"\nProcessing: {arcname}")
+                    print(f"Processing: {arcname}")
                     
                     if os.path.islink(item_path):
-                        # Handle symbolic links
+                        # Handle symlinks
                         try:
                             link_target = os.readlink(item_path)
-                            print(f"  Symlink -> {link_target}")
                             info = tarfile.TarInfo(arcname)
                             info.type = tarfile.SYMTYPE
                             info.linkname = link_target
@@ -286,73 +129,59 @@ def extract_layer_contents(layer_path, output_dir):
                             tar.addfile(info)
                             successful_items += 1
                         except Exception as e:
-                            print(f"  Error reading symlink: {e}")
                             errors.append(f"Error with symlink {arcname}: {str(e)}")
                             continue
                             
                     elif item_type == 'dir':
                         # Handle directories
                         try:
-                            print(f"  Directory")
                             info = tarfile.TarInfo(arcname)
                             info.type = tarfile.DIRTYPE
                             info.mode = 0o755
                             tar.addfile(info)
                             successful_items += 1
                         except Exception as e:
-                            print(f"  Error adding directory: {e}")
                             errors.append(f"Error with directory {arcname}: {str(e)}")
                             continue
                             
                     else:
                         # Handle regular files
                         try:
-                            size = os.path.getsize(item_path)
-                            if size > 0:
-                                print(f"  File ({size} bytes)")
+                            if os.path.getsize(item_path) > 0:
                                 tar.add(item_path, arcname=arcname)
-                                successful_items += 1
                             else:
-                                print(f"  Empty file")
                                 info = tarfile.TarInfo(arcname)
                                 info.type = tarfile.REGTYPE
                                 info.mode = 0o644
                                 info.size = 0
                                 tar.addfile(info)
-                                successful_items += 1
+                            successful_items += 1
                         except Exception as e:
-                            print(f"  Error adding file: {e}")
                             errors.append(f"Error with file {arcname}: {str(e)}")
                             continue
                     
                     processed_items += 1
-                    if processed_items % 100 == 0 or processed_items == total_items:
-                        success_rate = (successful_items / processed_items) * 100
-                        print(f"Progress: {processed_items}/{total_items} items processed ({success_rate:.1f}% success rate)")
+                    if processed_items % 100 == 0:
+                        print(f"Progress: {processed_items}/{len(all_items)} items")
                         
                 except Exception as e:
-                    error_msg = f"Error processing {item_path}: {str(e)}"
-                    print(f"  Error: {error_msg}")
-                    errors.append(error_msg)
+                    errors.append(f"Error processing {item_path}: {str(e)}")
                     continue
-            
-        # Final status report
-        print(f"\nProcessing complete:")
-        print(f"- Total items: {total_items}")
-        print(f"- Processed: {processed_items}")
-        print(f"- Successful: {successful_items}")
-        print(f"- Failed: {len(errors)}")
-        
-        if errors:
-            print(f"\nErrors encountered ({len(errors)} total):")
-            for error in errors[:10]:
-                print(f"  - {error}")
-            if len(errors) > 10:
-                print(f"  ... and {len(errors) - 10} more errors")
-        
+
         if successful_items > 0:
-            tarball_size = os.path.getsize(layer_tarball)
-            print(f"\nCreated layer tarball: {layer_tarball} ({tarball_size} bytes)")
+            print(f"\nLayer extraction complete:")
+            print(f"- Total items: {len(all_items)}")
+            print(f"- Processed: {processed_items}")
+            print(f"- Successful: {successful_items}")
+            print(f"- Failed: {len(errors)}")
+            
+            if errors:
+                print("\nErrors encountered:")
+                for error in errors[:10]:
+                    print(f"  - {error}")
+                if len(errors) > 10:
+                    print(f"  ... and {len(errors) - 10} more errors")
+            
             return layer_tarball
         else:
             raise ValueError("No items were successfully processed")
@@ -415,34 +244,522 @@ def create_dockerfile(metadata, output_dir):
 
 def create_manifest(image_id, layer_paths, output_dir):
     """Create a Docker image manifest file."""
+    print("\nCreating manifest file...")
+    
+    # Sort layer paths to ensure correct order
+    layer_paths.sort(key=lambda x: int(os.path.basename(os.path.dirname(x)).split('_')[1]))
+    
+    # Convert layer paths to the format Docker expects
+    layers = []
+    for layer_path in layer_paths:
+        layer_dir = os.path.dirname(layer_path)
+        layer_name = os.path.basename(layer_dir)
+        layers.append(f"{layer_name}/layer.tar")
+    
     manifest = [{
-        'Config': f'{image_id}.json',
-        'RepoTags': ['forensic/recovered:latest'],
-        'Layers': [os.path.basename(layer) for layer in layer_paths]
+        "Config": f"{image_id}.json",
+        "RepoTags": ["forensic/recovered:latest"],
+        "Layers": layers  # Each layer should be in the format "layer_N/layer.tar"
     }]
     
-    manifest_path = os.path.join(output_dir, 'manifest.json')
-    with open(manifest_path, 'w') as f:
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     
-    print(f"Created manifest at: {manifest_path}")
+    print(f"Created manifest with {len(layers)} layers")
+    print("Layer order in manifest:")
+    for layer in layers:
+        print(f"  - {layer}")
+    
     return manifest_path
 
-def create_docker_tarball(image_id, manifest_path, layer_paths, metadata_path, output_dir):
+def create_docker_tarball(config_name, manifest_path, layer_paths, config_path, output_dir):
     """Create a Docker image tarball that can be imported with docker load."""
-    output_path = os.path.join(output_dir, f"{image_id}.tar")
-    print(f"Creating Docker image tarball: {output_path}")
+    print("\nCreating Docker image archive...")
     
-    with tarfile.open(output_path, 'w') as tar:
-        # Add manifest
-        tar.add(manifest_path, arcname='manifest.json')
+    archive_path = os.path.join(output_dir, "image.tar")
+    
+    with tarfile.open(archive_path, "w") as tar:
+        # Add manifest first (Docker expects this)
+        tar.add(manifest_path, arcname="manifest.json")
         
-        # Add image config
-        tar.add(metadata_path, arcname=f'{image_id}.json')
+        # Add image config with the exact name referenced in manifest
+        tar.add(config_path, arcname=config_name)
         
-        # Add layer tarballs
+        # Add each layer maintaining the directory structure
         for layer_path in layer_paths:
-            tar.add(layer_path, arcname=os.path.basename(layer_path))
+            layer_dir = os.path.dirname(layer_path)
+            layer_name = os.path.basename(layer_dir)
+            tar.add(layer_path, arcname=f"{layer_name}/layer.tar")
     
-    print(f"Created Docker image tarball at: {output_path}")
-    return output_path
+    print(f"Created Docker image archive: {archive_path}")
+    return archive_path
+
+def find_layer_content(docker_root: str, layer_id: str) -> Optional[str]:
+    """
+    Find a single layer's content directory.
+    Returns the path to the layer's diff directory if found, None otherwise.
+    """
+    print(f"\nSearching for layer: {layer_id}")
+    
+    # First try exact match
+    result = find_layer_by_id(docker_root, layer_id, any_prefix=False)
+    if result:
+        layer_dir, content_dir = result
+        print(f"Found layer content at: {content_dir}")
+        return content_dir
+    
+    # Then try prefix match
+    result = find_layer_by_id(docker_root, layer_id, any_prefix=True)
+    if result:
+        layer_dir, content_dir = result
+        print(f"Found layer content by prefix at: {content_dir}")
+        return content_dir
+        
+    print(f"Could not find content for layer: {layer_id}")
+    return None
+
+def follow_layer_stack(docker_root: str, layer_id: str) -> List[str]:
+    """
+    Follow the layer stack from top to bottom using layer chain information.
+    Returns a list of layer paths from lowest (base) to highest.
+    """
+    print(f"\n=== Starting layer stack traversal for {layer_id} ===")
+    stack = []
+    visited = set()
+    current_id = clean_layer_id(layer_id)
+    print(f"Initial layer ID (cleaned): {current_id}")
+    
+    while current_id and current_id not in visited:
+        visited.add(current_id)
+        print(f"\n=== Following layer: {current_id} ===")
+        
+        # Clean up any malformed paths that might have gotten into the ID
+        original_id = current_id
+        current_id = re.sub(r'[\\/].*$', '', current_id)  # Remove anything after a slash or backslash
+        current_id = current_id.strip()
+        
+        if original_id != current_id:
+            print(f"Cleaned layer ID from '{original_id}' to '{current_id}'")
+        
+        # Find current layer directory
+        print(f"Searching for layer directory with ID: {current_id}")
+        result = find_layer_by_id(docker_root, current_id)
+        if not result:
+            print(f"Could not find directory for layer: {current_id}")
+            print("Dirs in overlay2:")
+            overlay2_dir = os.path.join(docker_root, 'overlay2')
+            if os.path.exists(overlay2_dir):
+                try:
+                    print([d for d in os.listdir(overlay2_dir) if os.path.isdir(os.path.join(overlay2_dir, d))][:5])
+                except Exception as e:
+                    print(f"Error listing overlay2: {e}")
+            break
+        
+        layer_dir, content_dir = result
+        stack.append(content_dir)
+        print(f"Added layer path to stack: {content_dir}")
+        
+        # Try to find parent layer using multiple methods
+        parent_id = None
+        print("\nSearching for parent layer...")
+        
+        # Method 1: Check parent file in layer database
+        clean_id = current_id.replace('sha256:', '')
+        layer_db = os.path.join(docker_root, 'image', 'overlay2', 'layerdb', 'sha256', clean_id)
+        if os.path.exists(layer_db):
+            print(f"Found layer database at: {layer_db}")
+            # First try direct parent reference            parent_file = os.path.join(layer_db, 'parent')
+            if os.path.exists(parent_file):
+                try:
+                    with open(parent_file, 'r') as f:
+                        parent_id = f.read().strip()
+                        print(f"Found parent in database: {parent_id}")
+                except Exception as e:
+                    print(f"Error reading parent file: {e}")
+        
+        # Method 2: Check chain-id and follow parent chain
+        if not parent_id:
+            chain_file = os.path.join(layer_db, 'chain-id')
+            if os.path.exists(chain_file):
+                try:
+                    with open(chain_file, 'r') as f:
+                        chain_id = f.read().strip()
+                        print(f"Found chain ID: {chain_id}")
+                        # Try to find parent chain
+                        for entry in os.listdir(os.path.dirname(layer_db)):
+                            entry_db = os.path.join(os.path.dirname(layer_db), entry)
+                            if os.path.isdir(entry_db):
+                                entry_chain = os.path.join(entry_db, 'chain-id')
+                                if os.path.exists(entry_chain):
+                                    with open(entry_chain, 'r') as f:
+                                        entry_chain_id = f.read().strip()
+                                        if entry_chain_id == chain_id and entry != clean_id:
+                                            parent_id = entry
+                                            print(f"Found parent through chain: {parent_id}")
+                                            break
+                except Exception as e:
+                    print(f"Error checking chain ID: {e}")
+        
+        # Method 3: Check lower file in overlay directory
+        if not parent_id:
+            lower_file = os.path.join(layer_dir, 'lower')
+            if os.path.exists(lower_file):
+                try:
+                    with open(lower_file, 'r') as f:
+                        lower_layers = f.read().strip()
+                        if lower_layers:
+                            # Format is l1:l2:l3 where each l is a short ID
+                            lower_ids = lower_layers.split(':')
+                            if lower_ids:
+                                parent_id = lower_ids[0]  # Take immediate parent
+                                print(f"Found parent in lower file: {parent_id}")
+                except Exception as e:
+                    print(f"Error reading lower file: {e}")
+        
+        if parent_id:
+            # Clean up parent ID and ensure it's not corrupted
+            parent_id = parent_id.replace('sha256:', '').strip()
+            parent_id = re.sub(r'[\\/].*$', '', parent_id)  # Remove anything after a slash or backslash
+            print(f"Moving to cleaned parent layer: {parent_id}")
+            current_id = parent_id
+        else:
+            print("No parent layer found, reached base layer")
+            break
+    
+    # Reverse stack so base layer is first
+    return list(reversed(stack))
+
+def extract_image_layers(image_id: str, mount_path: str, output_dir: str) -> bool:
+    """Extract all layers of a Docker image to the output directory."""
+    print(f"\nStarting extraction of image: {image_id}")
+    print(f"Mount path: {mount_path}")
+    print(f"Output directory: {output_dir}")
+    
+    try:
+        # Find Docker root directory
+        docker_root = find_docker_root(mount_path)
+        print(f"\nFound Docker root at: {docker_root}")
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Find and parse image config
+        image_path = None
+        config_dir = os.path.join(docker_root, 'image', 'overlay2', 'imagedb', 'content', 'sha256')
+        if os.path.exists(config_dir):
+            # Try both full ID and short ID
+            possible_paths = [
+                os.path.join(config_dir, image_id),
+                os.path.join(config_dir, image_id[:12])
+            ]
+            for path in possible_paths:
+                if os.path.exists(path):
+                    image_path = path
+                    break
+                else:
+                    # Try partial matches
+                    for filename in os.listdir(config_dir):
+                        if filename.startswith(image_id[:12]):
+                            image_path = os.path.join(config_dir, filename)
+                            break
+                    if image_path:
+                        break
+        
+        if not image_path:
+            raise ValueError(f"Could not find image config for ID: {image_id}")
+        
+        # Parse image config and set up metadata
+        config = clean_and_parse_json(image_path)
+        config_name = os.path.basename(image_path)  # Use the full SHA256 ID as filename
+        metadata_path = os.path.join(output_dir, config_name)
+        with open(metadata_path, 'w') as f:
+            json.dump(config, f, indent=2)
+
+        # Get layer information and process layers
+        if 'rootfs' not in config or 'diff_ids' not in config['rootfs']:
+            raise ValueError("Invalid image metadata - missing layer information")
+            
+        layer_ids = config['rootfs']['diff_ids']
+        print(f"\nFound {len(layer_ids)} layers to process")
+        print("\nLayer IDs from image config:")
+        for idx, lid in enumerate(layer_ids):
+            print(f"{idx+1}. {lid}")
+
+        # Extract layers
+        layer_paths = []
+        processed_layers = set()
+
+        for i, layer_id in enumerate(layer_ids):
+            clean_id = clean_layer_id(layer_id)
+            
+            try:
+                if clean_id in processed_layers:
+                    print(f"Layer {clean_id} already processed, skipping")
+                    continue
+
+                # Create output directory for this layer
+                layer_dir = os.path.join(output_dir, f"layer_{i:03d}")
+                os.makedirs(layer_dir, exist_ok=True)
+
+                # Extract the layer
+                layer_path = find_layer_content(docker_root, clean_id)
+                if layer_path:
+                    print(f"Extracting layer content from: {layer_path}")
+                    layer_tarball = extract_layer_contents(layer_path, layer_dir)
+                    if layer_tarball and os.path.exists(layer_tarball):
+                        layer_paths.append(layer_tarball)
+                        processed_layers.add(clean_id)
+                else:
+                    print(f"Could not find layer {clean_id}, skipping")
+
+            except Exception as e:
+                print(f"Error extracting layer {i+1}: {e}")
+                continue
+
+        if not layer_paths:
+            raise ValueError("No layers were successfully extracted")
+            
+        print(f"\nSuccessfully extracted {len(layer_paths)} of {len(layer_ids)} layers")
+
+        # Sort layers by their numerical index
+        sorted_paths = sorted(layer_paths, key=lambda x: int(os.path.basename(os.path.dirname(x)).split('_')[1]))
+        layers_in_manifest = []
+        
+        for layer_path in sorted_paths:
+            layer_dir = os.path.dirname(layer_path)
+            layer_name = os.path.basename(layer_dir)
+            layers_in_manifest.append(f"{layer_name}/layer.tar")
+            
+        # Create manifest with exact config name including .json extension
+        config_filename = config_name + '.json'  # Add .json extension
+        manifest = [{
+            'Config': config_filename,  # Use filename with .json extension
+            'RepoTags': ['forensic/recovered:latest'],
+            'Layers': layers_in_manifest
+        }]
+        
+        manifest_path = os.path.join(output_dir, 'manifest.json')
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+        
+        # Save metadata with .json extension as referenced in manifest
+        metadata_filename = os.path.join(output_dir, config_filename)
+        if metadata_path != metadata_filename:
+            os.rename(metadata_path, metadata_filename)
+            metadata_path = metadata_filename
+            
+        # Create importable archive
+        archive_path = create_docker_tarball(
+            config_filename,  # Pass filename with .json extension
+            manifest_path,
+            sorted_paths,
+            metadata_path,
+            output_dir
+        )
+        
+        print(f"\nExtraction complete. Output saved to: {output_dir}")
+        print(f"\nTo import the image, run:")
+        print(f"docker load -i {os.path.basename(archive_path)}")
+        
+        return True
+
+    except Exception as e:
+        print(f"\nERROR during extraction: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# Helper functions
+
+def find_layer_by_diff_id(docker_root: str, target_diff_id: str) -> Optional[Tuple[str, str]]:
+    """Find a layer directory by matching its diff ID against a target."""
+    overlay2_dir = os.path.join(docker_root, 'overlay2')
+    layer_db_dir = os.path.join(docker_root, 'image', 'overlay2', 'layerdb', 'sha256')
+    
+    target_diff_id = clean_layer_id(target_diff_id)
+    print(f"\n=== Searching for layer with diff ID: {target_diff_id} ===")
+    print("\nSearching through layer database with detailed logging...")
+    
+    # First try to find the layer's cache ID from the layer database
+    for entry in os.listdir(layer_db_dir):
+        layer_db = os.path.join(layer_db_dir, entry)
+        print(f"\nExamining layer database entry: {entry}")
+        
+        # Check chain ID first
+        chain_file = os.path.join(layer_db, 'chain-id')
+        if os.path.exists(chain_file):
+            try:
+                with open(chain_file, 'r') as f:
+                    chain_id = f.read().strip()
+                    chain_id = clean_layer_id(chain_id)
+                    print(f"Chain ID: {chain_id}")
+            except Exception as e:
+                print(f"Error reading chain ID: {e}")
+        
+        # Then check diff ID
+        diff_file = os.path.join(layer_db, 'diff')
+        if os.path.exists(diff_file):
+            try:
+                with open(diff_file, 'r') as f:
+                    diff_id = f.read().strip()
+                    diff_id = clean_layer_id(diff_id)
+                    print(f"Diff ID: {diff_id}")
+                    if diff_id == target_diff_id:
+                        print("*** Found matching diff ID ***")
+                        # Get cache ID for this layer
+                        cache_file = os.path.join(layer_db, 'cache-id')
+                        if os.path.exists(cache_file):
+                            with open(cache_file, 'r') as f:
+                                cache_id = f.read().strip()
+                                print(f"Cache ID: {cache_id}")
+                                # Look up content in overlay2
+                                overlay_dir = os.path.join(overlay2_dir, cache_id)
+                                if os.path.exists(overlay_dir):
+                                    print(f"Found overlay directory: {overlay_dir}")
+                                    content_dir = os.path.join(overlay_dir, 'diff')
+                                    if os.path.exists(content_dir):
+                                        print(f"Found content at: {content_dir}")
+                                        return overlay_dir, content_dir
+            except Exception as e:
+                print(f"Error reading layer info: {e}")
+                continue
+    
+    if not os.path.exists(layer_db_dir):
+        print(f"Layer database not found at: {layer_db_dir}")
+        return None
+        
+    # Search through layer database for matching diff ID
+    for entry in os.listdir(layer_db_dir):
+        layer_db = os.path.join(layer_db_dir, entry)
+        if not os.path.isdir(layer_db):
+            continue
+            
+        diff_file = os.path.join(layer_db, 'diff')
+        if not os.path.exists(diff_file):
+            continue
+            
+        try:
+            with open(diff_file, 'r') as f:
+                diff_id = f.read().strip()
+                diff_id = clean_layer_id(diff_id)
+                
+                print(f"\nComparing diff IDs:")
+                print(f"  Target: {target_diff_id}")
+                print(f"  Found:  {diff_id}")
+                
+                if diff_id == target_diff_id:
+                    print(f"Found matching diff ID in: {entry}")
+                    # Get cache ID to find content
+                    cache_file = os.path.join(layer_db, 'cache-id')
+                    if os.path.exists(cache_file):
+                        with open(cache_file, 'r') as f:
+                            cache_id = f.read().strip()
+                            print(f"Found cache ID: {cache_id}")
+                            # Look for content in overlay2 directory
+                            overlay_dir = os.path.join(overlay2_dir, cache_id)
+                            if os.path.exists(overlay_dir):
+                                content_dir = os.path.join(overlay_dir, 'diff')
+                                if os.path.exists(content_dir):
+                                    print(f"Found layer content at: {content_dir}")
+                                    return overlay_dir, content_dir
+                            else:
+                                print(f"Overlay directory not found: {overlay_dir}")
+                    else:
+                        print(f"No cache-id file found in {layer_db}")
+        except Exception as e:
+            print(f"Error processing layer {entry}: {e}")
+            continue
+    
+    print(f"No matching diff ID found for: {target_diff_id}")
+    return None
+
+def find_layer_by_id(docker_root: str, layer_id: str, any_prefix: bool = False) -> Optional[Tuple[str, str]]:
+    """
+    Find a layer directory by its ID in the overlay2 directory structure.
+    
+    Args:
+        docker_root: Docker root directory path
+        layer_id: Layer ID (can be content hash, chain ID, or cache ID)
+        any_prefix: Whether to match ID prefixes
+        
+    Returns:
+        Tuple of (layer_dir, content_dir) if found, None otherwise
+    """
+    clean_id = clean_layer_id(layer_id)
+    short_id = clean_id[:12]
+    print(f"\n=== Looking for layer: {clean_id} ===")
+    print(f"Short ID: {short_id}")
+    
+    # First try to find layer by diff ID since that's what image config uses
+    result = find_layer_by_diff_id(docker_root, clean_id)
+    if result:
+        return result
+        
+    # If that fails, try cache ID lookup
+    overlay2_dir = os.path.join(docker_root, 'overlay2')
+    layer_db_dir = os.path.join(docker_root, 'image', 'overlay2', 'layerdb', 'sha256')
+    
+    print(f"Checking overlay2 directory: {overlay2_dir}")
+    print(f"Checking layer database: {layer_db_dir}")
+    
+    if not os.path.exists(overlay2_dir):
+        print(f"ERROR: Overlay2 directory not found: {overlay2_dir}")
+        return None
+    
+    # Try direct lookup in layer database
+    print("\nSearching layer database by ID...")
+    layer_db = os.path.join(layer_db_dir, clean_id)
+    if os.path.exists(layer_db):
+        print(f"Found exact match in database: {clean_id}")
+        # Try to find overlay directory
+        cache_file = os.path.join(layer_db, 'cache-id')
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r') as f:
+                    cache_id = f.read().strip()
+                    print(f"Found cache ID: {cache_id}")
+                    overlay_dir = os.path.join(overlay2_dir, cache_id)
+                    if os.path.exists(overlay_dir):
+                        content_dir = os.path.join(overlay_dir, 'diff')
+                        if os.path.exists(content_dir):
+                            print(f"Found layer content at: {content_dir}")
+                            return overlay_dir, content_dir
+            except Exception as e:
+                print(f"Error reading cache file: {e}")
+    
+    # If still not found, try search in overlay2/l symlinks
+    l_dir = os.path.join(overlay2_dir, 'l')
+    if os.path.exists(l_dir):
+        print("\nSearching l/ directory for symlinks...")
+        for entry in os.listdir(l_dir):
+            try:
+                link_target = os.readlink(os.path.join(l_dir, entry))
+                print(f"\nFound symlink: {entry} -> {link_target}")
+                target_dir = os.path.abspath(os.path.join(l_dir, link_target))
+                if entry == clean_id or (any_prefix and entry.startswith(short_id)):
+                    print(f"MATCH: Found matching symlink: {entry}")
+                    if os.path.exists(target_dir):
+                        content_dir = os.path.join(target_dir, 'diff')
+                        if os.path.exists(content_dir):
+                            print(f"Found layer content at: {content_dir}")
+                            return target_dir, content_dir
+            except Exception as e:
+                print(f"Error with symlink {entry}: {e}")
+                continue
+    
+    print(f"\nCould not find layer: {clean_id}")
+    return None
+
+def clean_layer_id(layer_id: str) -> str:
+    """Clean up a layer ID by removing any path components and prefixes."""
+    # Remove sha256: prefix if present
+    clean_id = layer_id.replace('sha256:', '')
+    
+    # Remove any path components
+    clean_id = re.sub(r'[\\/].*$', '', clean_id)
+    
+    # Remove any trailing garbage
+    clean_id = clean_id.split()[0]
+    
+    return clean_id.strip()

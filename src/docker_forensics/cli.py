@@ -6,7 +6,7 @@ Command-line interface for the Docker forensics tool.
 import argparse
 import os
 import sys
-from docker_forensics.core import extract_image_layers
+from docker_forensics.docker import extract_image_layers
 
 def main():
     parser = argparse.ArgumentParser(

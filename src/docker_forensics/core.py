@@ -6,15 +6,15 @@ Core functionality for extracting Docker images from forensic disk images.
 import json
 import os
 import sys
-import shutil
 from pathlib import Path
 
 from .utils import normalize_path
 from .docker import (
-    find_docker_root, find_layer_dir, extract_layer_contents,
+    find_docker_root, extract_layer_contents,
     create_dockerfile, create_manifest, create_docker_tarball,
     clean_and_parse_json
 )
+from .layer_lookup import build_layer_mapping, resolve_layer_location
 
 def extract_image_layers(image_id, mount_path, output_dir):
     """Extract image data from a mounted Docker host filesystem."""
@@ -63,19 +63,34 @@ def extract_image_layers(image_id, mount_path, output_dir):
         layer_ids = metadata['rootfs']['diff_ids']
         print(f"\nFound {len(layer_ids)} layers to process")
         
-        # Extract each layer
+        # Extract each layer with chain and parent tracking
         layer_paths = []
         success_count = 0
+        last_chain_id = None
         
         for i, layer_id in enumerate(layer_ids):
             print(f"\nProcessing layer {i+1}/{len(layer_ids)}: {layer_id}")
             try:
-                # Create layer output directory
-                layer_output_dir = os.path.join(image_output_dir, f"layer_{i}")
+                # Create layer output directory with index for proper ordering
+                layer_output_dir = os.path.join(image_output_dir, f"layer_{i:03d}")
                 os.makedirs(layer_output_dir, exist_ok=True)
                 
-                # Find and extract layer
-                layer_dir = find_layer_dir(docker_root, layer_id)
+                # Get layer chain info
+                clean_id = layer_id.replace('sha256:', '')
+                layer_db_path = os.path.join(docker_root, 'image', 'overlay2', 'layerdb', 'sha256', clean_id)
+                
+                # Get current chain ID
+                current_chain_id = None
+                chain_file = os.path.join(layer_db_path, 'chain-id')
+                if os.path.exists(chain_file):
+                    with open(chain_file, 'r') as f:
+                        current_chain_id = f.read().strip()
+                        print(f"Layer chain ID: {current_chain_id}")
+                
+                # Find and extract layer, passing chain info
+                layer_dir = find_layer_dir(docker_root, layer_id, chain_id=current_chain_id, parent_chain_id=last_chain_id)
+                
+                # Extract layer contents
                 layer_tarball = extract_layer_contents(layer_dir, layer_output_dir)
                 
                 if layer_tarball and os.path.exists(layer_tarball):
@@ -84,6 +99,9 @@ def extract_image_layers(image_id, mount_path, output_dir):
                     print(f"Layer {i+1} extracted successfully")
                 else:
                     print(f"Warning: Layer {i+1} extraction produced no output")
+                
+                # Update chain ID for next layer
+                last_chain_id = current_chain_id
                 
             except Exception as e:
                 print(f"Error extracting layer {i+1}: {e}")
@@ -98,12 +116,28 @@ def extract_image_layers(image_id, mount_path, output_dir):
         print("\nGenerating Dockerfile...")
         create_dockerfile(metadata, image_output_dir)
         
-        # Create manifest
-        print("Creating image manifest...")
-        manifest_path = create_manifest(full_image_id, layer_paths, image_output_dir)
+        # Create manifest, ensuring proper layer order
+        print("Creating image manifest with proper layer order...")
+        manifest = [{
+            'Config': f'{full_image_id}.json',
+            'RepoTags': ['forensic/recovered:latest'],
+            'Layers': []
+        }]
+        
+        # Sort layer paths by directory name to maintain order
+        layer_paths.sort(key=lambda p: os.path.basename(os.path.dirname(p)))
+        manifest[0]['Layers'] = [os.path.basename(p) for p in layer_paths]
+        
+        manifest_path = os.path.join(image_output_dir, 'manifest.json')
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+        
+        print("\nLayer order in manifest:")
+        for i, layer in enumerate(manifest[0]['Layers']):
+            print(f"{i + 1}. {layer}")
         
         # Create importable Docker image archive
-        print("Creating Docker image archive...")
+        print("\nCreating Docker image archive...")
         archive_path = create_docker_tarball(
             full_image_id, 
             manifest_path, 
